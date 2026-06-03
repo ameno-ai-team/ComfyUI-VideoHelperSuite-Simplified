@@ -4,6 +4,7 @@
         "-n", "-c:v", "libx264",
         "-pix_fmt", ["pix_fmt", ["yuv420p", "yuv420p10le"]],
         "-crf", ["crf","INT", {"default": 19, "min": 0, "max": 100, "step": 1}],
+        "-preset", ["preset", ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"]],
         "-vf", "scale=out_color_matrix=bt709",
         "-color_range", "tv", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"
     ],
