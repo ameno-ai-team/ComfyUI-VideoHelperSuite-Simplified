@@ -1,14 +1,11 @@
-from .utils import ffmpeg_path, merge_filter_args, ENCODE_ARGS, cached
+from .utils import ffmpeg_path, merge_filter_args, ENCODE_ARGS
 from .load_video_nodes import LoadVideoUpload, LoadVideoPath
 from concurrent.futures import ThreadPoolExecutor
 from comfy.utils import ProgressBar
-from string import Template
-from .logger import logger
 import folder_paths
 import numpy as np
 import subprocess
 import tempfile
-import json
 import uuid
 import sys
 import os
@@ -19,99 +16,9 @@ if len(folder_paths.folder_names_and_paths['VHS_video_formats'][1]) == 0:
     folder_paths.folder_names_and_paths["VHS_video_formats"][1].add(".json")
 audio_extensions = ['mp3', 'mp4', 'wav', 'ogg']
 
-def flatten_list(l):
-    ret = []
-    for e in l:
-        if isinstance(e, list):
-            ret.extend(e)
-        else:
-            ret.append(e)
-    return ret
-
-def iterate_format(video_format, for_widgets=True):
-    """Provides an iterator over widgets, or arguments"""
-    def indirector(cont, index):
-        if isinstance(cont[index], list) and (not for_widgets
-          or len(cont[index])> 1 and not isinstance(cont[index][1], dict)):
-            inp = yield cont[index]
-            if inp is not None:
-                cont[index] = inp
-                yield
-    for k in video_format:
-        if k == "extra_widgets":
-            if for_widgets:
-                yield from video_format["extra_widgets"]
-        elif k.endswith("_pass"):
-            for i in range(len(video_format[k])):
-                yield from indirector(video_format[k], i)
-            if not for_widgets:
-                video_format[k] = flatten_list(video_format[k])
-        else:
-            yield from indirector(video_format, k)
-
-base_formats_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "video_formats")
-@cached(5)
-def get_video_formats():
-    format_files = {}
-    for format_name in folder_paths.get_filename_list("VHS_video_formats"):
-        format_files[format_name] = folder_paths.get_full_path("VHS_video_formats", format_name)
-    for item in os.scandir(base_formats_dir):
-        if not item.is_file() or not item.name.endswith('.json'):
-            continue
-        format_files[item.name[:-5]] = item.path
-    formats = []
-    format_widgets = {}
-    for format_name, path in format_files.items():
-        with open(path, 'r') as stream:
-            video_format = json.load(stream)
-        widgets = list(iterate_format(video_format))
-        formats.append("video/" + format_name)
-        if (len(widgets) > 0):
-            format_widgets["video/"+ format_name] = widgets
-    return formats, format_widgets
-
-def apply_format_widgets(format_name, kwargs):
-    if os.path.exists(os.path.join(base_formats_dir, format_name + ".json")):
-        video_format_path = os.path.join(base_formats_dir, format_name + ".json")
-    else:
-        video_format_path = folder_paths.get_full_path("VHS_video_formats", format_name)
-    with open(video_format_path, 'r') as stream:
-        video_format = json.load(stream)
-    for w in iterate_format(video_format):
-        if w[0] not in kwargs:
-            if len(w) > 2 and 'default' in w[2]:
-                default = w[2]['default']
-            else:
-                if type(w[1]) is list:
-                    default = w[1][0]
-                else:
-                    #NOTE: This doesn't respect max/min, but should be good enough as a fallback to a fallback to a fallback
-                    default = {"BOOLEAN": False, "INT": 0, "FLOAT": 0, "STRING": ""}[w[1]]
-            kwargs[w[0]] = default
-            logger.warn(f"Missing input for {w[0]} has been set to {default}")
-    wit = iterate_format(video_format, False)
-    for w in wit:
-        while isinstance(w, list):
-            if len(w) == 1:
-                #TODO: mapping=kwargs should be safer, but results in key errors, investigate why
-                w = [Template(x).substitute(**kwargs) for x in w[0]]
-                break
-            elif isinstance(w[1], dict):
-                w = w[1][str(kwargs[w[0]])]
-            elif len(w) > 3:
-                w = Template(w[3]).substitute(val=kwargs[w[0]])
-            else:
-                w = str(kwargs[w[0]])
-        wit.send(w)
-    return video_format
-
-def tensor_to_int(tensor, bits):
-    tensor = tensor.cpu().numpy() * (2**bits-1) + 0.5
-    return np.clip(tensor, 0, (2**bits-1))
-def tensor_to_shorts(tensor):
-    return tensor_to_int(tensor, 16).astype(np.uint16)
 def tensor_to_bytes(tensor):
-    return tensor_to_int(tensor, 8).astype(np.uint8)
+    tensor = tensor.cpu().numpy() * (2**8-1) + 0.5
+    return np.clip(tensor, 0, (2**8-1)).astype(np.uint8)
 
 class FfmpegProcess:
     def __init__(self, args, file_path, env):
@@ -140,7 +47,6 @@ class FfmpegProcess:
 class VideoCombine:
     @classmethod
     def INPUT_TYPES(s):
-        ffmpeg_formats, format_widgets = get_video_formats()
         return {
             "required": {
                 "images": ("IMAGE",),
@@ -149,7 +55,7 @@ class VideoCombine:
                     {"default": 8, "min": 1, "step": 1},
                 ),
                 "filename_prefix": ("STRING", {"default": "AnimateDiff"}),
-                "format": (ffmpeg_formats, {'formats': format_widgets}),
+                "format": (["video/h264-mp4"],),
             },
             "optional": {
                 "audio": ("AUDIO",),
@@ -184,17 +90,11 @@ class VideoCombine:
             _,
             subfolder,
             _,
-        ) = folder_paths.get_save_image_path(
-            filename_prefix,
-            folder_paths.get_output_directory()
-        )
-        output_files = []
-
+        ) = folder_paths.get_save_image_path(filename_prefix, folder_paths.get_output_directory())
         counter = str(uuid.uuid4())
 
         file = f"{filename}_{counter}.mp4"
         file_path = os.path.join(full_output_folder, file)
-
         env = os.environ.copy()
 
         # If audio is present, convert it to a temp WAV file up front so it
@@ -250,7 +150,6 @@ class VideoCombine:
                 output_process.write_frame(image)
 
         output_process.close()
-        output_files.append(file_path)
 
         if audio_temp_path:
             os.remove(audio_temp_path)
@@ -264,7 +163,7 @@ class VideoCombine:
             "workflow": '',
             "fullpath": file_path,
         }
-        return {"ui": {"gifs": [preview]}, "result": ((True, output_files),)}
+        return {"ui": {"gifs": [preview]}, "result": ((True, [file_path]),)}
 
 class VideoInfo:
     @classmethod
