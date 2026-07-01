@@ -1,4 +1,4 @@
-from .utils import ffmpeg_path, merge_filter_args, ENCODE_ARGS
+from .utils import ffmpeg_path, merge_filter_args
 from .load_video_nodes import LoadVideoUpload, LoadVideoPath
 from comfy.utils import ProgressBar
 import folder_paths
@@ -6,33 +6,11 @@ import subprocess
 import tempfile
 import torch
 import uuid
-import sys
 import os
 
 def tensor_to_bytes_gpu(tensor_batch):
-    # tensor_batch: (N, H, W, C) on GPU, float in [0,1]
     scaled = torch.clamp(tensor_batch * 255.0 + 0.5, 0, 255).to(torch.uint8)
     return scaled.cpu().numpy()
-
-class FfmpegProcess:
-    def __init__(self, args, file_path, env):
-        self.proc = subprocess.Popen(args + [file_path], stderr=subprocess.PIPE,
-                                      stdin=subprocess.PIPE, env=env)
-
-    def write_frame(self, frame_data):
-        try:
-            self.proc.stdin.write(frame_data)
-        except BrokenPipeError:
-            res = self.proc.stderr.read()
-            raise Exception("An error occurred in the ffmpeg subprocess:\n" + res.decode(*ENCODE_ARGS))
-
-    def close(self):
-        self.proc.stdin.flush()
-        self.proc.stdin.close()
-        res = self.proc.stderr.read()
-        self.proc.wait()
-        if len(res) > 0:
-            print(res.decode(*ENCODE_ARGS), end="", file=sys.stderr)
 
 class VideoCombine:
     @classmethod
@@ -69,7 +47,6 @@ class VideoCombine:
         pbar = ProgressBar(num_frames)
 
         first_image = images[0]
-        # images = iter(images)
 
         # get output information
         (
@@ -104,8 +81,7 @@ class VideoCombine:
                 subprocess.run(wav_args, input=audio_data, env=env,
                                 check=True, capture_output=True)
             except subprocess.CalledProcessError as e:
-                raise Exception("An error occurred converting audio:\n"
-                                 + e.stderr.decode(*ENCODE_ARGS))
+                raise Exception("An error occurred converting audio")
 
         args = [
             ffmpeg_path, "-v", "error", "-f", "rawvideo", "-pix_fmt", 'rgb24',
@@ -130,14 +106,16 @@ class VideoCombine:
 
         merge_filter_args(args)
 
-        output_process = FfmpegProcess(args, file_path, env)
+        output_process = subprocess.Popen(args + [file_path], stderr=subprocess.PIPE, stdin=subprocess.PIPE, env=env)
         byte_batch = tensor_to_bytes_gpu(images)
         
         for frame in byte_batch:
             pbar.update(1)
-            output_process.write_frame(frame.tobytes())
+            output_process.stdin.write(frame.tobytes())
 
-        output_process.close()
+        output_process.stdin.flush()
+        output_process.stdin.close()
+        output_process.wait()
 
         preview = {
             "filename": file,
