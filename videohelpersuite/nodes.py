@@ -220,20 +220,6 @@ def gifski_process(args, dimensions, frame_rate, video_format, file_path, env):
                 raise Exception("An error occurred while creating gifski output\n" \
                         + "Make sure you are using gifski --version >=1.32.0\nffmpeg: " \
                         + resff.decode(*ENCODE_ARGS) + '\ngifski: ' + resgs.decode(*ENCODE_ARGS))
-    if len(resff) > 0:
-        print(resff.decode(*ENCODE_ARGS), end="", file=sys.stderr)
-    if len(resgs) > 0:
-        print(resgs.decode(*ENCODE_ARGS), end="", file=sys.stderr)
-    #should always be empty as the quiet flag is passed
-    if len(outgs) > 0:
-        print(outgs.decode(*ENCODE_ARGS))
-
-def to_pingpong(inp):
-    if not hasattr(inp, "__getitem__"):
-        inp = list(inp)
-    yield from inp
-    for i in range(len(inp)-2,0,-1):
-        yield inp[i]
 
 class VideoCombine:
     @classmethod
@@ -319,16 +305,7 @@ class VideoCombine:
 
         metadata = PngInfo()
         video_metadata = {}
-        if prompt is not None:
-            metadata.add_text("prompt", json.dumps(prompt))
-            video_metadata["prompt"] = prompt
-        if extra_pnginfo is not None:
-            for x in extra_pnginfo:
-                metadata.add_text(x, json.dumps(extra_pnginfo[x]))
-                video_metadata[x] = extra_pnginfo[x]
-            extra_options = extra_pnginfo.get('workflow', {}).get('extra', {})
-        else:
-            extra_options = {}
+        extra_options = {}
         metadata.add_text("CreationTime", datetime.datetime.now().isoformat(" ")[:19])
 
         if meta_batch is not None and unique_id in meta_batch.outputs:
@@ -389,24 +366,22 @@ class VideoCombine:
             dimensions = (first_image.shape[1], first_image.shape[0])
 
         loop_args = []
-        if video_format.get('input_color_depth', '8bit') == '16bit':
-            images = map(tensor_to_shorts, images)
-            if has_alpha:
-                i_pix_fmt = 'rgba64'
-            else:
-                i_pix_fmt = 'rgb48'
+        # if video_format.get('input_color_depth', '8bit') == '16bit':
+        #     images = map(tensor_to_shorts, images)
+        #     if has_alpha:
+        #         i_pix_fmt = 'rgba64'
+        #     else:
+        #         i_pix_fmt = 'rgb48'
+        # else:
+        images = map(tensor_to_bytes, images)
+        if has_alpha:
+            i_pix_fmt = 'rgba'
         else:
-            images = map(tensor_to_bytes, images)
-            if has_alpha:
-                i_pix_fmt = 'rgba'
-            else:
-                i_pix_fmt = 'rgb24'
+            i_pix_fmt = 'rgb24'
+                
         file = f"{filename}_{counter:05}.{video_format['extension']}"
         file_path = os.path.join(full_output_folder, file)
-        bitrate_arg = []
-        bitrate = video_format.get('bitrate')
-        if bitrate is not None:
-            bitrate_arg = ["-b:v", str(bitrate) + "M" if video_format.get('megabit') == 'True' else str(bitrate) + "K"]
+        
         args = [ffmpeg_path, "-v", "error", "-f", "rawvideo", "-pix_fmt", i_pix_fmt,
                 # The image data is in an undefined generic RGB color space, which in practice means sRGB.
                 # sRGB has the same primaries and matrix as BT.709, but a different transfer function (gamma),
@@ -424,40 +399,16 @@ class VideoCombine:
 
         images = map(lambda x: x.tobytes(), images)
         env=os.environ.copy()
-        if  "environment" in video_format:
-            env.update(video_format["environment"])
 
-        if "pre_pass" in video_format:
-            if meta_batch is not None:
-                #Performing a prepass requires keeping access to all frames.
-                #Potential solutions include keeping just output frames in
-                #memory or using 3 passes with intermediate file, but
-                #very long gifs probably shouldn't be encouraged
-                raise Exception("Formats which require a pre_pass are incompatible with Batch Manager.")
-            images = [b''.join(images)]
-            os.makedirs(folder_paths.get_temp_directory(), exist_ok=True)
-            in_args_len = args.index("-i") + 2 # The index after ["-i", "-"]
-            pre_pass_args = args[:in_args_len] + video_format['pre_pass']
-            merge_filter_args(pre_pass_args)
-            try:
-                subprocess.run(pre_pass_args, input=images[0], env=env,
-                                capture_output=True, check=True)
-            except subprocess.CalledProcessError as e:
-                raise Exception("An error occurred in the ffmpeg prepass:\n" \
-                        + e.stderr.decode(*ENCODE_ARGS))
         if "inputs_main_pass" in video_format:
             in_args_len = args.index("-i") + 2 # The index after ["-i", "-"]
             args = args[:in_args_len] + video_format['inputs_main_pass'] + args[in_args_len:]
 
         if output_process is None:
-            if 'gifski_pass' in video_format:
-                format = 'image/gif'
-                output_process = gifski_process(args, dimensions, frame_rate, video_format, file_path, env)
-                audio = None
-            else:
-                args += video_format['main_pass'] + bitrate_arg
-                merge_filter_args(args)
-                output_process = ffmpeg_process(args, video_format, video_metadata, file_path, env)
+            args += video_format['main_pass']
+            merge_filter_args(args)
+            output_process = ffmpeg_process(args, video_format, video_metadata, file_path, env)
+            
             #Proceed to first yield
             output_process.send(None)
             if meta_batch is not None:
@@ -485,7 +436,6 @@ class VideoCombine:
             return {"ui": {"unfinished_batch": [True]}, "result": ((save_output, []),)}
 
         output_files.append(file_path)
-
 
         a_waveform = None
         if audio is not None:
@@ -534,22 +484,15 @@ class VideoCombine:
             #It will be muted unless opened or saved with right click
             file = output_file_with_audio
             
-        if extra_options.get('VHS_KeepIntermediate', True) == False:
-            for intermediate in output_files[1:-1]:
-                if os.path.exists(intermediate):
-                    os.remove(intermediate)
         preview = {
-                "filename": file,
-                "subfolder": subfolder,
-                "type": "output" if save_output else "temp",
-                "format": format,
-                "frame_rate": frame_rate,
-                "workflow": first_image_file,
-                "fullpath": output_files[-1],
-            }
-        if num_frames == 1 and 'png' in format and '%03d' in file:
-            preview['format'] = 'image/png'
-            preview['filename'] = file.replace('%03d', '001')
+            "filename": file,
+            "subfolder": subfolder,
+            "type": "output" if save_output else "temp",
+            "format": format,
+            "frame_rate": frame_rate,
+            "workflow": first_image_file,
+            "fullpath": output_files[-1],
+        }
         return {"ui": {"gifs": [preview]}, "result": ((save_output, output_files),)}
 
 class VideoInfo:
