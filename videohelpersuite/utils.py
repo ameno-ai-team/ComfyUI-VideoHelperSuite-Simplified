@@ -4,14 +4,9 @@ from typing import Iterable
 import shutil
 import subprocess
 import re
-import time
 from collections.abc import Mapping
-from typing import Union
-import functools
 import torch
-from torch import Tensor
 
-import server
 from .logger import logger
 import folder_paths
 
@@ -42,24 +37,6 @@ def ffmpeg_suitability(path):
         if copyright_year.isnumeric():
             score += int(copyright_year)
     return score
-
-class MultiInput(str):
-    def __new__(cls, string, allowed_types="*"):
-        res = super().__new__(cls, string)
-        res.allowed_types=allowed_types
-        return res
-    def __ne__(self, other):
-        if self.allowed_types == "*" or other == "*":
-            return False
-        return other not in self.allowed_types
-imageOrLatent = MultiInput("IMAGE", ["IMAGE", "LATENT"])
-floatOrInt = MultiInput("FLOAT", ["FLOAT", "INT"])
-
-class ContainsAll(dict):
-    def __contains__(self, other):
-        return True
-    def __getitem__(self, key):
-        return super().get(key, (None, {}))
 
 if "VHS_FORCE_FFMPEG_PATH" in os.environ:
     ffmpeg_path = os.environ.get("VHS_FORCE_FFMPEG_PATH")
@@ -160,62 +137,7 @@ def calculate_file_hash(filename: str, hash_every_n: int = 1):
     h.update(str(os.path.getmtime(filename)).encode())
     return h.hexdigest()
 
-prompt_queue = server.PromptServer.instance.prompt_queue
-def requeue_workflow_unchecked():
-    """Requeues the current workflow without checking for multiple requeues"""
-    currently_running = prompt_queue.currently_running
-    value = next(iter(currently_running.values()))
-    
-    # Handle both old (5 values) and new (6 values) ComfyUI versions
-    if len(value) == 6:
-        (_, prompt_id, prompt, extra_data, outputs_to_execute, _) = value
-    else:
-        (_, prompt_id, prompt, extra_data, outputs_to_execute) = value
-    
-    #Ensure batch_managers are marked stale
-    prompt = prompt.copy()
-    for uid in prompt:
-        if prompt[uid]['class_type'] == 'VHS_BatchManager':
-            prompt[uid]['inputs']['requeue'] = prompt[uid]['inputs'].get('requeue',0)+1
-
-    #execution.py has guards for concurrency, but server doesn't.
-    #TODO: Check that this won't be an issue
-    number = -server.PromptServer.instance.number
-    server.PromptServer.instance.number += 1
-    prompt_id = str(server.uuid.uuid4())
-    # Put back with 6 elements to match what ComfyUI expects
-    sensitive = value[5] if len(value) > 5 else {}
-    prompt_queue.put((number, prompt_id, prompt, extra_data, outputs_to_execute, sensitive))
-
 requeue_guard = [None, 0, 0, {}]
-
-def requeue_workflow(requeue_required=(-1,True)):
-    assert(len(prompt_queue.currently_running) == 1)
-    global requeue_guard
-    
-    value = next(iter(prompt_queue.currently_running.values()))
-    
-    # Handle both old (5 values) and new (6 values) ComfyUI versions
-    if len(value) == 6:
-        (run_number, _, prompt, extra_data, outputs_to_execute, _) = value
-    else:
-        (run_number, _, prompt, extra_data, outputs_to_execute) = value
-    
-    if requeue_guard[0] != run_number:
-        #Calculate a count of how many outputs are managed by a batch manager
-        managed_outputs=0
-        for bm_uid in prompt:
-            if prompt[bm_uid]['class_type'] == 'VHS_BatchManager':
-                for output_uid in prompt:
-                    if prompt[output_uid]['class_type'] in ["VHS_VideoCombine"]:
-                        for inp in prompt[output_uid]['inputs'].values():
-                            if inp == [bm_uid, 0]:
-                                managed_outputs+=1
-        requeue_guard = [run_number, 0, managed_outputs, {}]
-    requeue_guard[1] = requeue_guard[1]+1
-    requeue_guard[3][requeue_required[0]] = requeue_required[1]
-    if requeue_guard[1] == requeue_guard[2] and max(requeue_guard[3].values()):
-        requeue_workflow_unchecked()
 
 def get_audio(file, start_time=0, duration=0):
     args = [ffmpeg_path, "-i", file]
@@ -318,122 +240,3 @@ def validate_path(path, allow_none=False, allow_url=True):
     if not os.path.isfile(strip_path(path)):
         return "Invalid file path: {}".format(path)
     return is_safe_path(path)
-
-
-def validate_index(index: int, length: int=0, is_range: bool=False, allow_negative=False, allow_missing=False) -> int:
-    # if part of range, do nothing
-    if is_range:
-        return index
-    # otherwise, validate index
-    # validate not out of range - only when latent_count is passed in
-    if length > 0 and index > length-1 and not allow_missing:
-        raise IndexError(f"Index '{index}' out of range for {length} item(s).")
-    # if negative, validate not out of range
-    if index < 0:
-        if not allow_negative:
-            raise IndexError(f"Negative indeces not allowed, but was '{index}'.")
-        conv_index = length+index
-        if conv_index < 0 and not allow_missing:
-            raise IndexError(f"Index '{index}', converted to '{conv_index}' out of range for {length} item(s).")
-        index = conv_index
-    return index
-
-
-def convert_to_index_int(raw_index: str, length: int=0, is_range: bool=False, allow_negative=False, allow_missing=False) -> int:
-    try:
-        return validate_index(int(raw_index), length=length, is_range=is_range, allow_negative=allow_negative, allow_missing=allow_missing)
-    except ValueError as e:
-        raise ValueError(f"Index '{raw_index}' must be an integer.", e)
-
-
-def convert_str_to_indexes(indexes_str: str, length: int=0, allow_missing=False) -> list[int]:
-    if not indexes_str:
-        return []
-    int_indexes = list(range(0, length))
-    allow_negative = length > 0
-    chosen_indexes = []
-    # parse string - allow positive ints, negative ints, and ranges separated by ':'
-    groups = indexes_str.split(",")
-    groups = [g.strip() for g in groups]
-    for g in groups:
-        # parse range of indeces (e.g. 2:16)
-        if ':' in g:
-            index_range = g.split(":", 2)
-            index_range = [r.strip() for r in index_range]
-
-            start_index = index_range[0]
-            if len(start_index) > 0:
-                start_index = convert_to_index_int(start_index, length=length, is_range=True, allow_negative=allow_negative, allow_missing=allow_missing)
-            else:
-                start_index = 0
-            end_index = index_range[1]
-            if len(end_index) > 0:
-                end_index = convert_to_index_int(end_index, length=length, is_range=True, allow_negative=allow_negative, allow_missing=allow_missing)
-            else:
-                end_index = length
-            # support step as well, to allow things like reversing, every-other, etc.
-            step = 1
-            if len(index_range) > 2:
-                step = index_range[2]
-                if len(step) > 0:
-                    step = convert_to_index_int(step, length=length, is_range=True, allow_negative=True, allow_missing=True)
-                else:
-                    step = 1
-            # if latents were passed in, base indeces on known latent count
-            if len(int_indexes) > 0:
-                chosen_indexes.extend(int_indexes[start_index:end_index][::step])
-            # otherwise, assume indeces are valid
-            else:
-                chosen_indexes.extend(list(range(start_index, end_index, step)))
-        # parse individual indeces
-        else:
-            chosen_indexes.append(convert_to_index_int(g, length=length, allow_negative=allow_negative, allow_missing=allow_missing))
-    return chosen_indexes
-
-
-def select_indexes(input_obj: Union[Tensor, list], idxs: list):
-    if type(input_obj) == Tensor:
-        return input_obj[idxs]
-    else:
-        return [input_obj[i] for i in idxs]
-
-def merge_filter_args(args, ftype="-vf"):
-    #TODO This doesn't account for filter_complex
-    #Will likely need to convert all filters to filter complex in the future
-    #But that requires source/output deduplication
-    try:
-        start_index = args.index(ftype)+1
-        index = start_index
-        while True:
-            index = args.index(ftype, index)
-            args[start_index] += ',' + args[index+1]
-            args.pop(index)
-            args.pop(index)
-    except ValueError:
-        pass
-
-def select_indexes_from_str(input_obj: Union[Tensor, list], indexes: str, err_if_missing=True, err_if_empty=True):
-    real_idxs = convert_str_to_indexes(indexes, len(input_obj), allow_missing=not err_if_missing)
-    if err_if_empty and len(real_idxs) == 0:
-        raise Exception(f"Nothing was selected based on indexes found in '{indexes}'.")
-    return select_indexes(input_obj, real_idxs)
-
-def hook(obj, attr):
-    def dec(f):
-        f = functools.update_wrapper(f, getattr(obj,attr))
-        setattr(obj,attr,f)
-        return f
-    return dec
-
-def cached(duration):
-    def dec(f):
-        cached_ret = None
-        cache_time = 0
-        def cached_func():
-            nonlocal cache_time, cached_ret
-            if time.time() > cache_time + duration or cached_ret is None:
-                cache_time = time.time()
-                cached_ret = f()
-            return cached_ret
-        return cached_func
-    return dec

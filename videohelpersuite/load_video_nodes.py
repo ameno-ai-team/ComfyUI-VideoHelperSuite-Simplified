@@ -2,7 +2,6 @@ import os
 import itertools
 import numpy as np
 import torch
-from PIL import Image, ImageOps
 import cv2
 import psutil
 import subprocess
@@ -12,11 +11,8 @@ import time
 import folder_paths
 from comfy.utils import common_upscale, ProgressBar
 import nodes
-from comfy.k_diffusion.utils import FolderOfImages
 from .logger import logger
-from .utils import BIGMAX, DIMMAX, calculate_file_hash, get_sorted_dir_files_from_directory,\
-        lazy_get_audio, hash_path, validate_path, strip_path, try_download_video,  \
-        is_url, imageOrLatent, ffmpeg_path, ENCODE_ARGS, floatOrInt
+from .utils import BIGMAX, DIMMAX, calculate_file_hash, lazy_get_audio, strip_path, ffmpeg_path, ENCODE_ARGS
 
 
 video_extensions = ['webm', 'mp4', 'mkv', 'gif', 'mov']
@@ -432,7 +428,7 @@ class LoadVideoUpload:
                     files.append(f)
         return {"required": {
                     "video": (sorted(files),),
-                    "force_rate": (floatOrInt, {"default": 0, "min": 0, "max": 60, "step": 1, "disable": 0}),
+                    "force_rate": ("INT", {"default": 0, "min": 0, "max": 60, "step": 1, "disable": 0}),
                     "custom_width": ("INT", {"default": 0, "min": 0, "max": DIMMAX, 'disable': 0}),
                     "custom_height": ("INT", {"default": 0, "min": 0, "max": DIMMAX, 'disable': 0}),
                     "frame_load_cap": ("INT", {"default": 0, "min": 0, "max": BIGMAX, "step": 1, "disable": 0}),
@@ -452,7 +448,7 @@ class LoadVideoUpload:
 
     CATEGORY = "Video Helper Suite 🎥🅥🅗🅢"
 
-    RETURN_TYPES = (imageOrLatent, "INT", "AUDIO", "VHS_VIDEOINFO")
+    RETURN_TYPES = ("IMAGE", "INT", "AUDIO", "VHS_VIDEOINFO")
     RETURN_NAMES = ("IMAGE", "frame_count", "audio", "video_info")
 
     FUNCTION = "load_video"
@@ -471,201 +467,3 @@ class LoadVideoUpload:
         if not folder_paths.exists_annotated_filepath(video):
             return "Invalid video file: {}".format(video)
         return True
-
-
-class LoadVideoPath:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "video": ("STRING", {"placeholder": "X://insert/path/here.mp4", "vhs_path_extensions": video_extensions}),
-                "force_rate": (floatOrInt, {"default": 0, "min": 0, "max": 60, "step": 1, "disable": 0}),
-                "custom_width": ("INT", {"default": 0, "min": 0, "max": DIMMAX, 'disable': 0}),
-                "custom_height": ("INT", {"default": 0, "min": 0, "max": DIMMAX, 'disable': 0}),
-                "frame_load_cap": ("INT", {"default": 0, "min": 0, "max": BIGMAX, "step": 1, "disable": 0}),
-                "skip_first_frames": ("INT", {"default": 0, "min": 0, "max": BIGMAX, "step": 1}),
-                "select_every_nth": ("INT", {"default": 1, "min": 1, "max": BIGMAX, "step": 1}),
-            },
-            "optional": {
-                "meta_batch": ("VHS_BatchManager",),
-                "vae": ("VAE",),
-                "format": get_load_formats(),
-            },
-            "hidden": {
-                "force_size": "STRING",
-                "unique_id": "UNIQUE_ID"
-            },
-        }
-
-    CATEGORY = "Video Helper Suite 🎥🅥🅗🅢"
-
-    RETURN_TYPES = (imageOrLatent, "INT", "AUDIO", "VHS_VIDEOINFO")
-    RETURN_NAMES = ("IMAGE", "frame_count", "audio", "video_info")
-
-    FUNCTION = "load_video"
-
-    def load_video(self, **kwargs):
-        if kwargs['video'] is None or validate_path(kwargs['video']) != True:
-            raise Exception("video is not a valid path: " + kwargs['video'])
-        if is_url(kwargs['video']):
-            kwargs['video'] = try_download_video(kwargs['video']) or kwargs['video']
-        return load_video(**kwargs)
-
-    @classmethod
-    def IS_CHANGED(s, video, **kwargs):
-        return hash_path(video)
-
-    @classmethod
-    def VALIDATE_INPUTS(s, video):
-        return validate_path(video, allow_none=True)
-
-class LoadVideoFFmpegUpload:
-    @classmethod
-    def INPUT_TYPES(s):
-        input_dir = folder_paths.get_input_directory()
-        files = []
-        for f in os.listdir(input_dir):
-            if os.path.isfile(os.path.join(input_dir, f)):
-                file_parts = f.split('.')
-                if len(file_parts) > 1 and (file_parts[-1].lower() in video_extensions):
-                    files.append(f)
-        return {"required": {
-                    "video": (sorted(files),),
-                    "force_rate": (floatOrInt, {"default": 0, "min": 0, "max": 60, "step": 1, "disable": 0}),
-                    "custom_width": ("INT", {"default": 0, "min": 0, "max": DIMMAX, 'disable': 0}),
-                    "custom_height": ("INT", {"default": 0, "min": 0, "max": DIMMAX, 'disable': 0}),
-                    "frame_load_cap": ("INT", {"default": 0, "min": 0, "max": BIGMAX, "step": 1, "disable": 0}),
-                    "start_time": ("FLOAT", {"default": 0, "min": 0, "max": BIGMAX, "step": .001, "widgetType": "VHSTIMESTAMP"}),
-                    },
-                "optional": {
-                    "meta_batch": ("VHS_BatchManager",),
-                    "vae": ("VAE",),
-                     "format": get_load_formats(),
-                },
-                "hidden": {
-                    "force_size": "STRING",
-                    "unique_id": "UNIQUE_ID"
-
-                },
-                }
-
-    CATEGORY = "Video Helper Suite 🎥🅥🅗🅢"
-
-    RETURN_TYPES = (imageOrLatent, "MASK", "AUDIO", "VHS_VIDEOINFO")
-    RETURN_NAMES = ("IMAGE", "mask", "audio", "video_info")
-
-    FUNCTION = "load_video"
-
-    def load_video(self, **kwargs):
-        kwargs['video'] = folder_paths.get_annotated_filepath(strip_path(kwargs['video']))
-        image, _, audio, video_info =  load_video(**kwargs, generator=ffmpeg_frame_generator)
-        if image.size(3) == 4:
-            return (image[:,:,:,:3], 1-image[:,:,:,3], audio, video_info)
-        return (image, torch.zeros(image.size(0), 64, 64, device="cpu"), audio, video_info)
-
-    @classmethod
-    def IS_CHANGED(s, video, **kwargs):
-        image_path = folder_paths.get_annotated_filepath(video)
-        return calculate_file_hash(image_path)
-
-    @classmethod
-    def VALIDATE_INPUTS(s, video):
-        if not folder_paths.exists_annotated_filepath(video):
-            return "Invalid video file: {}".format(video)
-        return True
-
-
-class LoadVideoFFmpegPath:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "video": ("STRING", {"placeholder": "X://insert/path/here.mp4", "vhs_path_extensions": video_extensions}),
-                "force_rate": (floatOrInt, {"default": 0, "min": 0, "max": 60, "step": 1, "disable": 0}),
-                "custom_width": ("INT", {"default": 0, "min": 0, "max": DIMMAX, 'disable': 0}),
-                "custom_height": ("INT", {"default": 0, "min": 0, "max": DIMMAX, 'disable': 0}),
-                "frame_load_cap": ("INT", {"default": 0, "min": 0, "max": BIGMAX, "step": 1, "disable": 0}),
-                "start_time": ("FLOAT", {"default": 0, "min": 0, "max": BIGMAX, "step": .001, "widgetType": "VHSTIMESTAMP"}),
-            },
-            "optional": {
-                "meta_batch": ("VHS_BatchManager",),
-                "vae": ("VAE",),
-                "format": get_load_formats(),
-            },
-            "hidden": {
-                "force_size": "STRING",
-                "unique_id": "UNIQUE_ID"
-            },
-        }
-
-    CATEGORY = "Video Helper Suite 🎥🅥🅗🅢"
-
-    RETURN_TYPES = (imageOrLatent, "MASK", "AUDIO", "VHS_VIDEOINFO")
-    RETURN_NAMES = ("IMAGE", "mask", "audio", "video_info")
-
-    FUNCTION = "load_video"
-
-    def load_video(self, **kwargs):
-        if kwargs['video'] is None or validate_path(kwargs['video']) != True:
-            raise Exception("video is not a valid path: " + kwargs['video'])
-        if is_url(kwargs['video']):
-            kwargs['video'] = try_download_video(kwargs['video']) or kwargs['video']
-        image, _, audio, video_info =  load_video(**kwargs, generator=ffmpeg_frame_generator)
-        if isinstance(image, dict):
-            return (image, None, audio, video_info)
-        if image.size(3) == 4:
-            return (image[:,:,:,:3], 1-image[:,:,:,3], audio, video_info)
-        return (image, torch.zeros(image.size(0), 64, 64, device="cpu"), audio, video_info)
-
-    @classmethod
-    def IS_CHANGED(s, video, **kwargs):
-        return hash_path(video)
-
-    @classmethod
-    def VALIDATE_INPUTS(s, video):
-        return validate_path(video, allow_none=True)
-
-class LoadImagePath:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "image": ("STRING", {"placeholder": "X://insert/path/here.png", "vhs_path_extensions": list(FolderOfImages.IMG_EXTENSIONS)}),
-                "custom_width": ("INT", {"default": 0, "min": 0, "max": DIMMAX, "step": 8, 'disable': 0}),
-                "custom_height": ("INT", {"default": 0, "min": 0, "max": DIMMAX, "step": 8, 'disable': 0}),
-            },
-            "optional": {
-                "vae": ("VAE",),
-            },
-            "hidden": {
-                "force_size": "STRING",
-            },
-        }
-
-    CATEGORY = "Video Helper Suite 🎥🅥🅗🅢"
-
-    RETURN_TYPES = (imageOrLatent, "MASK")
-    RETURN_NAMES = ("IMAGE", "mask")
-
-    FUNCTION = "load_image"
-
-    def load_image(self, **kwargs):
-        if kwargs['image'] is None or validate_path(kwargs['image']) != True:
-            raise Exception("image is not a valid path: " + kwargs['image'])
-        kwargs.update({'video':  kwargs['image'], 'force_rate': 0, 'frame_load_cap': 0,
-                      'start_time': 0})
-        kwargs.pop('image')
-        image, _, _, _ =  load_video(**kwargs, generator=ffmpeg_frame_generator)
-        if isinstance(image, dict):
-            return (image, None)
-        if image.size(3) == 4:
-            return (image[:,:,:,:3], 1-image[:,:,:,3])
-        return (image, torch.zeros(image.size(0), 64, 64, device="cpu"))
-
-    @classmethod
-    def IS_CHANGED(s, image, **kwargs):
-        return hash_path(image)
-
-    @classmethod
-    def VALIDATE_INPUTS(s, image):
-        return validate_path(image, allow_none=True)
