@@ -136,29 +136,6 @@ class FfmpegProcess:
             print(res.decode(*ENCODE_ARGS), end="", file=sys.stderr)
         return self.total_frames_output
 
-def ffmpeg_process(args, file_path, env):
-    res = None
-    frame_data = yield
-    total_frames_output = 0
-    if res != b'':
-        with subprocess.Popen(args + [file_path], stderr=subprocess.PIPE,
-                              stdin=subprocess.PIPE, env=env) as proc:
-            try:
-                while frame_data is not None:
-                    proc.stdin.write(frame_data)
-                    frame_data = yield
-                    total_frames_output+=1
-                proc.stdin.flush()
-                proc.stdin.close()
-                res = proc.stderr.read()
-            except BrokenPipeError as e:
-                res = proc.stderr.read()
-                raise Exception("An error occurred in the ffmpeg subprocess:\n" \
-                        + res.decode(*ENCODE_ARGS))
-    yield total_frames_output
-    if len(res) > 0:
-        print(res.decode(*ENCODE_ARGS), end="", file=sys.stderr)
-
 class VideoCombine:
     @classmethod
     def INPUT_TYPES(s):
@@ -254,26 +231,11 @@ class VideoCombine:
                 merge_filter_args(args)
                 output_process = FfmpegProcess(args, file_path, env)
 
-                if meta_batch is not None:
-                    meta_batch.outputs[unique_id] = (counter, output_process)
-
             for image in images:
                 pbar.update(1)
                 output_process.write_frame(image)
 
-        if meta_batch is not None:
-            requeue_workflow((meta_batch.unique_id, not meta_batch.has_closed_inputs))
-        if meta_batch is None or meta_batch.has_closed_inputs:
-            output_process.close()
-            if meta_batch is not None:
-                meta_batch.outputs.pop(unique_id)
-                if len(meta_batch.outputs) == 0:
-                    meta_batch.reset()
-        else:
-            # batch is unfinished
-            # TODO: Check if empty output breaks other custom nodes
-            return {"ui": {"unfinished_batch": [True]}, "result": ((True, []),)}
-
+        output_process.close()
         output_files.append(file_path)
 
         if audio is not None:
