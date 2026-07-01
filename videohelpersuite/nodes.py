@@ -3,7 +3,7 @@ import sys
 import json
 import subprocess
 import numpy as np
-import re
+from concurrent.futures import ThreadPoolExecutor
 import uuid
 from string import Template
 
@@ -113,6 +113,29 @@ def tensor_to_shorts(tensor):
 def tensor_to_bytes(tensor):
     return tensor_to_int(tensor, 8).astype(np.uint8)
 
+class FfmpegProcess:
+    def __init__(self, args, file_path, env):
+        self.proc = subprocess.Popen(args + [file_path], stderr=subprocess.PIPE,
+                                      stdin=subprocess.PIPE, env=env)
+        self.total_frames_output = 0
+
+    def write_frame(self, frame_data):
+        try:
+            self.proc.stdin.write(frame_data)
+            self.total_frames_output += 1
+        except BrokenPipeError:
+            res = self.proc.stderr.read()
+            raise Exception("An error occurred in the ffmpeg subprocess:\n"
+                             + res.decode(*ENCODE_ARGS))
+
+    def close(self):
+        self.proc.stdin.flush()
+        self.proc.stdin.close()
+        res = self.proc.stderr.read()
+        if len(res) > 0:
+            print(res.decode(*ENCODE_ARGS), end="", file=sys.stderr)
+        return self.total_frames_output
+
 def ffmpeg_process(args, file_path, env):
     res = None
     frame_data = yield
@@ -179,10 +202,10 @@ class VideoCombine:
     ):
         num_frames = len(images)
         pbar = ProgressBar(num_frames)
-       
+
         first_image = images[0]
         images = iter(images)
-        
+
         # get output information
         (
             full_output_folder,
@@ -191,123 +214,98 @@ class VideoCombine:
             subfolder,
             _,
         ) = folder_paths.get_save_image_path(
-            filename_prefix, 
+            filename_prefix,
             folder_paths.get_output_directory()
         )
         output_files = []
 
-        if meta_batch is not None and unique_id in meta_batch.outputs:
-            (counter, output_process) = meta_batch.outputs[unique_id]
-        else:
-            # comfy counter workaround
-            max_counter = 0
+        counter = str(uuid.uuid4())
+        output_process = None
 
-            # Loop through the existing files
-            matcher = re.compile(f"{re.escape(filename)}_(\\d+)\\D*\\..+", re.IGNORECASE)
-            for existing_file in os.listdir(full_output_folder):
-                # Check if the file matches the expected format
-                match = matcher.fullmatch(existing_file)
-                if match:
-                    # Extract the numeric portion of the filename
-                    file_counter = int(match.group(1))
-                    # Update the maximum counter value if necessary
-                    if file_counter > max_counter:
-                        max_counter = file_counter
-
-            # Increment the counter by 1 to get the next available value
-            counter = max_counter + 1
-            output_process = None
-        print(meta_batch)
         _, format_ext = format.split("/")
 
         has_alpha = first_image.shape[-1] == 4
         kwargs["has_alpha"] = has_alpha
         video_format = apply_format_widgets(format_ext, kwargs)
 
-        images = map(tensor_to_bytes, images)
+        # images = map(tensor_to_bytes, images)
         if has_alpha:
             i_pix_fmt = 'rgba'
         else:
             i_pix_fmt = 'rgb24'
-                
-        file = f"{filename}_{counter:05}.{video_format['extension']}"
+
+        file = f"{filename}_{counter}.{video_format['extension']}"
         file_path = os.path.join(full_output_folder, file)
-        
+
         args = [ffmpeg_path, "-v", "error", "-f", "rawvideo", "-pix_fmt", i_pix_fmt,
                 "-color_range", "pc", "-colorspace", "rgb", "-color_primaries", "bt709",
                 "-color_trc", video_format.get("fake_trc", "iec61966-2-1"),
                 "-s", f"{first_image.shape[1]}x{first_image.shape[0]}", "-r", str(frame_rate), "-i", "-"]
 
-        images = map(lambda x: x.tobytes(), images)
-        env=os.environ.copy()
-
-        if output_process is None:
-            args += video_format['main_pass']
-            merge_filter_args(args)
-            output_process = ffmpeg_process(args, file_path, env)
+        # images = map(lambda x: x.tobytes(), images)
+        env = os.environ.copy()
             
-            #Proceed to first yield
-            output_process.send(None)
-            if meta_batch is not None:
-                meta_batch.outputs[unique_id] = (counter, output_process)
-        
-        print(meta_batch)
-        
-        for image in images:
-            pbar.update(1)
-            output_process.send(image)
+        with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+            images = executor.map(tensor_to_bytes, images)
+            images = executor.map(lambda x: x.tobytes(), images)
+
+            if output_process is None:
+                args += video_format['main_pass']
+                merge_filter_args(args)
+                output_process = FfmpegProcess(args, file_path, env)
+
+                if meta_batch is not None:
+                    meta_batch.outputs[unique_id] = (counter, output_process)
+
+            for image in images:
+                pbar.update(1)
+                output_process.write_frame(image)
 
         if meta_batch is not None:
             requeue_workflow((meta_batch.unique_id, not meta_batch.has_closed_inputs))
         if meta_batch is None or meta_batch.has_closed_inputs:
-            #Close pipe and wait for termination.
-            try:
-                output_process.send(None)
-                output_process.send(None)
-            except StopIteration:
-                pass
+            output_process.close()
             if meta_batch is not None:
                 meta_batch.outputs.pop(unique_id)
                 if len(meta_batch.outputs) == 0:
                     meta_batch.reset()
         else:
-            #batch is unfinished
-            #TODO: Check if empty output breaks other custom nodes
+            # batch is unfinished
+            # TODO: Check if empty output breaks other custom nodes
             return {"ui": {"unfinished_batch": [True]}, "result": ((True, []),)}
-        print(meta_batch)
 
         output_files.append(file_path)
 
         if audio is not None:
             # Create audio file if input was provided
-            output_file_with_audio = f"{filename}_{counter:05}-audio.{video_format['extension']}"
+            output_file_with_audio = f"{filename}_{counter}-audio.{video_format['extension']}"
             output_file_with_audio_path = os.path.join(full_output_folder, output_file_with_audio)
             if "audio_pass" not in video_format:
                 logger.warn("Selected video format does not have explicit audio support")
                 video_format["audio_pass"] = ["-c:a", "libopus"]
 
             channels = audio['waveform'].size(1)
-            
+
             mux_args = [ffmpeg_path, "-v", "error", "-n", "-i", file_path,
                         "-ar", str(audio['sample_rate']), "-ac", str(channels),
                         "-f", "f32le", "-i", "-", "-c:v", "copy"] \
                         + video_format["audio_pass"] \
                         + ["-shortest", output_file_with_audio_path]
 
-            audio_data = audio['waveform'].squeeze(0).transpose(0,1).numpy().tobytes()
+            audio_data = audio['waveform'].squeeze(0).transpose(0, 1).numpy().tobytes()
             merge_filter_args(mux_args, '-af')
             try:
                 subprocess.run(mux_args, input=audio_data,
-                                        env=env, capture_output=True, check=True)
+                                env=env, capture_output=True, check=True)
             except subprocess.CalledProcessError as e:
-                raise Exception("An error occured in the ffmpeg subprocess:\n" \
-                        + e.stderr.decode(*ENCODE_ARGS))
+                raise Exception("An error occured in the ffmpeg subprocess:\n"
+                                 + e.stderr.decode(*ENCODE_ARGS))
 
             output_files.append(output_file_with_audio_path)
-            #Return this file with audio to the webui.
-            #It will be muted unless opened or saved with right click
-            file = output_file_with_audio 
-        
+            # Return this file with audio to the webui.
+            # It will be muted unless opened or saved with right click
+            file = output_file_with_audio
+
         preview = {
             "filename": file,
             "subfolder": subfolder,
