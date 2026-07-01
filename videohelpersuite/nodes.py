@@ -153,11 +153,7 @@ class VideoCombine:
             },
             "optional": {
                 "audio": ("AUDIO",),
-                "meta_batch": ("VHS_BatchManager",),
             },
-            "hidden": ContainsAll({
-                "unique_id": "UNIQUE_ID"
-            }),
         }
 
     RETURN_TYPES = ("VHS_FILENAMES",)
@@ -173,8 +169,6 @@ class VideoCombine:
         filename_prefix="AnimateDiff",
         format="image/gif",
         audio=None,
-        unique_id=None,
-        meta_batch=None,
         **kwargs
     ):
         num_frames = len(images)
@@ -197,7 +191,6 @@ class VideoCombine:
         output_files = []
 
         counter = str(uuid.uuid4())
-        output_process = None
 
         _, format_ext = format.split("/")
 
@@ -205,7 +198,6 @@ class VideoCombine:
         kwargs["has_alpha"] = has_alpha
         video_format = apply_format_widgets(format_ext, kwargs)
 
-        # images = map(tensor_to_bytes, images)
         if has_alpha:
             i_pix_fmt = 'rgba'
         else:
@@ -219,17 +211,13 @@ class VideoCombine:
                 "-color_trc", video_format.get("fake_trc", "iec61966-2-1"),
                 "-s", f"{first_image.shape[1]}x{first_image.shape[0]}", "-r", str(frame_rate), "-i", "-"]
 
-        # images = map(lambda x: x.tobytes(), images)
+        args += video_format['main_pass']
+        merge_filter_args(args)
         env = os.environ.copy()
+        output_process = FfmpegProcess(args, file_path, env)
             
         with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
-            images = executor.map(tensor_to_bytes, images)
-            images = executor.map(lambda x: x.tobytes(), images)
-
-            if output_process is None:
-                args += video_format['main_pass']
-                merge_filter_args(args)
-                output_process = FfmpegProcess(args, file_path, env)
+            images = executor.map(lambda x: tensor_to_bytes(x).tobytes(), images, chunksize=8)
 
             for image in images:
                 pbar.update(1)
@@ -242,10 +230,6 @@ class VideoCombine:
             # Create audio file if input was provided
             output_file_with_audio = f"{filename}_{counter}-audio.{video_format['extension']}"
             output_file_with_audio_path = os.path.join(full_output_folder, output_file_with_audio)
-            if "audio_pass" not in video_format:
-                logger.warn("Selected video format does not have explicit audio support")
-                video_format["audio_pass"] = ["-c:a", "libopus"]
-
             channels = audio['waveform'].size(1)
 
             mux_args = [ffmpeg_path, "-v", "error", "-n", "-i", file_path,
