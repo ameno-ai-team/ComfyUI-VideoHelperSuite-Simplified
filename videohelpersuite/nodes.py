@@ -96,15 +96,27 @@ class VideoCombine:
         if audio_temp_path:
             args += ["-c:a", "aac", "-movflags", "use_metadata_tags"]
 
-        output_process = subprocess.Popen(args + [file_path], stdin=subprocess.PIPE, env=env)
+        output_process = subprocess.Popen(
+            args + [file_path],
+            stdin=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env
+        )
         byte_batch = tensor_to_bytes_gpu(images)
 
-        for frame in byte_batch:
-            output_process.stdin.write(frame.tobytes())
+        try:
+            for frame in byte_batch:
+                output_process.stdin.write(frame.tobytes())
+            output_process.stdin.flush()
+        except BrokenPipeError:
+            pass  # ffmpeg died early, real error is in stderr below
 
-        output_process.stdin.flush()
         output_process.stdin.close()
         output_process.wait()
+
+        if output_process.returncode != 0:
+            stderr = output_process.stderr.read().decode(errors="replace")
+            raise Exception(f"ffmpeg failed: {stderr}")
 
         preview = {
             "filename": file,
